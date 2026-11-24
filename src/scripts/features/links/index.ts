@@ -18,6 +18,7 @@ import {
 import { randomString, stringMaxSize } from '../../shared/generic.ts'
 import { displayInterface } from '../../shared/display.ts'
 import { getHTMLTemplate } from '../../shared/dom.ts'
+import { getCache } from '../../shared/cache.ts'
 import { eventDebounce } from '../../utils/debounce.ts'
 import { tradThis } from '../../utils/translations.ts'
 import { storage } from '../../storage.ts'
@@ -320,7 +321,7 @@ function createIcons(local: Local): void {
         if (url.startsWith('link')) {
             img.src = local[`x-icon-${url}`] ?? ''
         } else {
-            img.src = url
+            setIconFromCache(img, url)
         }
     }
 
@@ -359,6 +360,35 @@ function createIcons(local: Local): void {
 
         initIconList = []
     }, 400)
+}
+
+/**
+ * Sets an icon from a remote URL, caches it in CacheStorage
+ * so next new tabs don't fetch it from the network again.
+ */
+async function setIconFromCache(img: HTMLImageElement, url: string): Promise<void> {
+    try {
+        const cache = await getCache('link-icons')
+        const cached = await cache.match(url)
+
+        if (cached) {
+            img.src = URL.createObjectURL(await cached.blob())
+            return
+        }
+
+        const response = await fetch(url)
+
+        if (response.ok) {
+            await cache.put(new Request(url), response.clone())
+            img.src = URL.createObjectURL(await response.blob())
+            return
+        }
+    } catch (_) {
+        //
+    }
+
+    // no cache, failed fetch or cache error: behaves like before
+    img.src = url
 }
 
 function initRows(row: number, style: string): void {
