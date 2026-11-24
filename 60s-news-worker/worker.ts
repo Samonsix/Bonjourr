@@ -1,6 +1,7 @@
 // 60s API -> Bonjourr 名言格式 [{ author, content }]
 // 部署: deno run -A npm:wrangler@latest deploy
 // 用法: https://<worker域名>/quotes?source=60s|weibo|zhihu|all&limit=20
+//       &random=1 表示每次访问从新闻池随机取 1 条（池本身仍缓存 15 分钟）
 
 const UPSTREAM = 'https://60s.viki.moe'
 
@@ -100,6 +101,19 @@ async function buildQuotes(source: string, limit: number): Promise<Quote[]> {
     return (await fetchSource(config)).slice(0, limit)
 }
 
+// 从新闻池随机取 1 条，响应本身不缓存
+function randomQuoteResponse(quotes: Quote[]): Response {
+    const index = Math.floor(Math.random() * quotes.length)
+
+    return new Response(JSON.stringify([quotes[index]]), {
+        headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+            ...corsHeaders(),
+        },
+    })
+}
+
 export default {
     async fetch(request: Request, _env: unknown, ctx: WorkerContext): Promise<Response> {
         if (request.method === 'OPTIONS') {
@@ -109,7 +123,7 @@ export default {
         const url = new URL(request.url)
 
         if (url.pathname !== '/quotes') {
-            return new Response(JSON.stringify({ usage: '/quotes?source=60s|weibo|zhihu|all&limit=20' }), {
+            return new Response(JSON.stringify({ usage: '/quotes?source=60s|weibo|zhihu|all&limit=20&random=1' }), {
                 status: 404,
                 headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders() },
             })
@@ -117,6 +131,7 @@ export default {
 
         const source = url.searchParams.get('source') ?? '60s'
         const limit = Math.min(Number(url.searchParams.get('limit')) || 20, 50)
+        const random = url.searchParams.get('random') === '1'
 
         // 按 TTL 分桶生成缓存键，桶变化后缓存未命中即重新拉取上游
         const bucket = Math.floor(Date.now() / (CACHE_TTL * 1000))
@@ -125,7 +140,7 @@ export default {
         const cached = await cache.match(cacheKey)
 
         if (cached) {
-            return cached
+            return random ? randomQuoteResponse((await cached.json()) as Quote[]) : cached
         }
 
         try {
@@ -135,7 +150,7 @@ export default {
                 throw new Error('upstream returned no data')
             }
 
-            const response = new Response(JSON.stringify(quotes), {
+            const poolResponse = new Response(JSON.stringify(quotes), {
                 headers: {
                     'Content-Type': 'application/json; charset=utf-8',
                     'Cache-Control': `public, max-age=${CACHE_TTL}`,
@@ -143,8 +158,9 @@ export default {
                 },
             })
 
-            ctx.waitUntil(cache.put(cacheKey, response.clone()))
-            return response
+            ctx.waitUntil(cache.put(cacheKey, poolResponse.clone()))
+
+            return random ? randomQuoteResponse(quotes) : poolResponse
         } catch (error) {
             return new Response(JSON.stringify({ error: String(error) }), {
                 status: 502,
