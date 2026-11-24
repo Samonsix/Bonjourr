@@ -3,7 +3,20 @@
 // 用法: https://<worker域名>/quotes?source=60s|weibo|zhihu|all&limit=20
 //       &random=1 表示每次访问从新闻池随机取 1 条（池本身仍缓存 15 分钟）
 
-const UPSTREAM = 'https://60s.viki.moe'
+// 上游公共实例列表，按顺序尝试，首个成功的会被优先复用
+// （主域名 60s.viki.moe 近期在部分地区不稳定，故保留多个备用）
+const BASES = [
+    'https://60s.viki.moe',
+    'https://60s.crystelf.top',
+    'https://60s.mizhoubaobei.top',
+    'https://api.elysiayanyu.top',
+    'https://60s.zellon.top',
+    'https://60s.superjeason.qzz.io',
+    'https://60s.okbaike.com',
+    'https://api.cczo.cc/60s',
+]
+
+let preferredBase = BASES[0]
 
 // 上游数据缓存时长（秒），缓存分桶到期后自动重新拉取
 const CACHE_TTL = 900
@@ -45,34 +58,56 @@ function corsHeaders(): Record<string, string> {
     }
 }
 
-// 拉取单个数据源并转换成 Bonjourr 格式
-async function fetchSource(config: SourceConfig): Promise<Quote[]> {
-    const response = await fetch(UPSTREAM + config.path)
+// 拉取单个数据源并转换成 Bonjourr 格式，实例失败自动换下一个
+// errors 数组可选，用于收集失败原因（调试用）
+async function fetchSource(config: SourceConfig, errors?: string[]): Promise<Quote[]> {
+    const bases = [preferredBase, ...BASES.filter((base) => base !== preferredBase)]
 
-    if (!response.ok) {
-        throw new Error(`${config.path} -> ${response.status}`)
+    for (const base of bases) {
+        try {
+            const response = await fetch(base + config.path, {
+                headers: { 'User-Agent': 'news-quotes-worker/1.0' },
+                signal: AbortSignal.timeout(8000),
+            })
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`)
+            }
+
+            const json = (await response.json()) as { data?: unknown }
+
+            // /v2/60s 的数据在 data.news 字符串数组里
+            let quotes: Quote[] = []
+
+            if (config.path === '/v2/60s') {
+                const data = json.data as { news?: string[] } | undefined
+                quotes = (data?.news ?? []).map((news) => ({ author: config.label, content: news }))
+            } else {
+                // 热榜类接口是 data: [{ title, ... }] 数组
+                const list = Array.isArray(json.data) ? (json.data as { title?: string }[]) : []
+                quotes = list
+                    .map((item) => ({ author: config.label, content: item.title ?? '' }))
+                    .filter((quote) => quote.content.length > 0)
+            }
+
+            if (quotes.length === 0) {
+                throw new Error('empty data')
+            }
+
+            preferredBase = base
+            return quotes
+        } catch (error) {
+            errors?.push(`${config.label} @ ${base}: ${error instanceof Error ? error.message : error}`)
+        }
     }
 
-    const json = (await response.json()) as { data: unknown }
-
-    // /v2/60s 的数据在 data.news 字符串数组里
-    if (config.path === '/v2/60s') {
-        const data = json.data as { news?: string[] }
-        return (data.news ?? []).map((news) => ({ author: config.label, content: news }))
-    }
-
-    // 热榜类接口是 data: [{ title, ... }] 数组
-    const list = Array.isArray(json.data) ? (json.data as { title?: string }[]) : []
-
-    return list
-        .map((item) => ({ author: config.label, content: item.title ?? '' }))
-        .filter((quote) => quote.content.length > 0)
+    return []
 }
 
-async function buildQuotes(source: string, limit: number): Promise<Quote[]> {
+async function buildQuotes(source: string, limit: number, errors?: string[]): Promise<Quote[]> {
     if (source === 'all') {
         const results = await Promise.all(
-            Object.values(SOURCES).map((config) => fetchSource(config).catch(() => [] as Quote[])),
+            Object.values(SOURCES).map((config) => fetchSource(config, errors)),
         )
 
         const seen = new Set<string>()
@@ -98,7 +133,7 @@ async function buildQuotes(source: string, limit: number): Promise<Quote[]> {
         throw new Error(`unknown source: ${source}`)
     }
 
-    return (await fetchSource(config)).slice(0, limit)
+    return (await fetchSource(config, errors)).slice(0, limit)
 }
 
 // 从新闻池随机取 1 条，响应本身不缓存
@@ -144,10 +179,11 @@ export default {
         }
 
         try {
-            const quotes = await buildQuotes(source, limit)
+            const errors: string[] = []
+            const quotes = await buildQuotes(source, limit, errors)
 
             if (quotes.length === 0) {
-                throw new Error('upstream returned no data')
+                throw new Error(errors.length > 0 ? errors.join(' | ') : 'upstream returned no data')
             }
 
             const poolResponse = new Response(JSON.stringify(quotes), {
