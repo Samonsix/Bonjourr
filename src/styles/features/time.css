@@ -57,7 +57,12 @@
 }
 
 .digital-hh,
-.digital-mm,
+.digital-mm {
+    display: inline-block;
+    width: 2ch;
+    text-align: center;
+}
+
 .digital-hh-separator {
     display: inline-block;
 }
@@ -74,7 +79,8 @@
 
 #time.seconds .digital-ss {
     display: inline-block;
-    width: var(--seconds-width);
+    width: 2ch;
+    text-align: center;
     font-variant-numeric: tabular-nums;
 }
 
